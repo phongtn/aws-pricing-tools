@@ -2,14 +2,14 @@ import json, logging
 from . import consts, models
 import datetime
 
-from ..ec2 import pricing as ec2pricing
+# from ..ec2 import pricing as ec2pricing
 from ..s3 import pricing as s3pricing
-from ..rds import pricing as rdspricing
-from ..emr import pricing as emrpricing
-from ..redshift import pricing as redshiftpricing
-from ..awslambda import pricing as lambdapricing
-from ..dynamodb import pricing as ddbpricing
-from ..kinesis import pricing as kinesispricing
+# from ..rds import pricing as rdspricing
+# from ..emr import pricing as emrpricing
+# from ..redshift import pricing as redshiftpricing
+# from ..awslambda import pricing as lambdapricing
+# from ..dynamodb import pricing as ddbpricing
+# from ..kinesis import pricing as kinesispricing
 from . errors import NoDataFoundError
 
 log = logging.getLogger()
@@ -43,7 +43,13 @@ def compare(**kwargs):
   origkwargs = kwargs #we'll keep track of the original paramaters
   scenarioArray = []
 
-
+  from ..ec2.pricing import pricing as ec2pricing
+  from ..rds import pricing as rdspricing
+  from ..emr import pricing as emrpricing
+  from ..redshift import pricing as redshiftpricing
+  from ..awslambda import pricing as lambdapricing
+  from ..dynamodb import pricing as ddbpricing
+  from ..kinesis import pricing as kinesispricing
 
   #Sort by AWS Region - Total Cost and To-region (for sorting by destination - find which regions are cheaper for backups)
   if sortCriteria in [consts.SORT_CRITERIA_REGION, consts.SORT_CRITERIA_TO_REGION]:
