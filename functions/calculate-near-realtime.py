@@ -26,7 +26,7 @@ import awspricecalculator.common.consts as consts
 from awspricecalculator.common.errors import NoDataFoundError
 
 log = logging.getLogger()
-#log.setLevel(logging.INFO)
+log.setLevel(consts.LOG_LEVEL)
 
 
 
@@ -99,7 +99,6 @@ SERVICE_RESOURCE_MAP = {SERVICE_EC2:[RESOURCE_EBS_VOLUME,RESOURCE_EBS_SNAPSHOT, 
 
 #_/_/_/_/_/_/ default values - end _/_/_/_/_/_/
 
-
 def handler(event, context):
     log.setLevel(consts.LOG_LEVEL)
     log.info("Received event {}".format(json.dumps(event)))
@@ -109,13 +108,7 @@ def handler(event, context):
 
         result = {}
         pricing_records = []
-        ec2Cost = 0
-        rdsCost = 0
-        lambdaCost = 0
-        ddbCost = 0
-        kinesisCost = 0
         totalCost = 0
-
 
         #First, get the tags we'll be searching for, from the CloudWatch scheduled event
         tagkey = ""
@@ -127,18 +120,164 @@ def handler(event, context):
               log.error("No tags specified, aborting function!")
               return {}
 
-          log.info("Will search resources with the following tag:["+tagkey+"] - value["+tagvalue+"]")
+        log.info("Will search resources with the following tag:["+tagkey+"] - value["+tagvalue+"]")
 
         resource_manager = ResourceManager(tagkey, tagvalue)
 
         start, end = calculate_time_range()
 
-        elb_hours = 0
-        elb_data_processed_gb = 0
-        elb_instances = {}
-        alb_hours = 0
-        alb_lcus = 0
+        ec2Cost = compute_ec2_cost(resource_manager, tagkey, tagvalue, pricing_records, start, end)
+        rdsCost = compute_rds_cost(resource_manager, tagkey, tagvalue, pricing_records)
+        lambdaCost = compute_lambda_cost(resource_manager, tagkey, tagvalue, pricing_records)
+        ddbCost = compute_dynamo_cost(resource_manager, tagkey, tagvalue, pricing_records)
+        kinesisCost  = compute_kinesis_cost(resource_manager, tagkey, tagvalue, pricing_records)
 
+        #Do this after all calculations for all supported services have concluded
+        totalCost = ec2Cost + rdsCost + lambdaCost + ddbCost + kinesisCost
+        result['pricingRecords'] = pricing_records
+        result['totalCost'] = round(totalCost,2)
+        result['forecastPeriod']=DEFAULT_FORECAST_PERIOD
+        result['currency'] = CW_METRIC_DIMENSION_CURRENCY_USD
+
+        #Publish metrics to CloudWatch using the default namespace
+        if tagkey:
+          put_cw_metric_data(end, ec2Cost, CW_METRIC_DIMENSION_SERVICE_NAME_EC2, tagkey, tagvalue)
+          put_cw_metric_data(end, rdsCost, CW_METRIC_DIMENSION_SERVICE_NAME_RDS, tagkey, tagvalue)
+          put_cw_metric_data(end, lambdaCost, CW_METRIC_DIMENSION_SERVICE_NAME_LAMBDA, tagkey, tagvalue)
+          put_cw_metric_data(end, ddbCost, CW_METRIC_DIMENSION_SERVICE_NAME_DYNAMODB, tagkey, tagvalue)
+          put_cw_metric_data(end, kinesisCost, CW_METRIC_DIMENSION_SERVICE_NAME_KINESIS, tagkey, tagvalue)
+          put_cw_metric_data(end, totalCost, CW_METRIC_DIMENSION_SERVICE_NAME_TOTAL, tagkey, tagvalue)
+
+        log.info("Estimated monthly cost for resources tagged with key={},value={} : [{}]".format(tagkey, tagvalue, json.dumps(result,sort_keys=False,indent=4)))
+
+    except NoDataFoundError as ndf:
+        log.error ("NoDataFoundError [{}]".format(ndf))
+    except Exception as e:
+        traceback.print_exc()
+        log.error("Exception message:["+str(e)+"]")
+    return result
+
+#TODO: calculate data transfer for instances that are not registered with the ELB
+#TODO: Support different OS for EC2 instances (see how engine and license combinations are calculated for RDS)
+#TODO: log the actual AWS resources that are found for the price calculation
+#TODO: add support for detailed metrics fee
+#TODO: add support for EBS optimized
+#TODO: add support for EIP
+#TODO: add support for EC2 operating systems other than Linux
+#TODO: calculate monthly hours based on the current month, instead of assuming 720
+#TODO: add support for different forecast periods (1 hour, 1 day, 1 month, etc.)
+#TODO: add support for Spot and Reserved. Function only supports On-demand instances at the time
+
+
+def compute_kinesis_cost(resource_manager, tagkey, tagvalue, pricing_records):
+    kinesisCost = 0
+    try:
+        #Kinesis Streams
+        streams = resource_manager.get_resources(SERVICE_KINESIS, RESOURCE_STREAM)
+        totalShards = 0
+        totalExtendedRetentionCount = 0
+        totalPutPayloadUnits = 0
+        for s in streams:
+            log.info("Stream:[{}]".format(s.id))
+            tmpShardCount, tmpExtendedRetentionCount = get_kinesis_stream_shards(s.id)
+            totalShards += tmpShardCount
+            totalExtendedRetentionCount += tmpExtendedRetentionCount
+
+            totalPutPayloadUnits += calculate_kinesis_put_payload_units(start, end, s.id)
+
+        if totalShards:
+            kinesispdim = data.KinesisPriceDimension(region=region,
+                                                     shardHours=totalShards*HOURS_DICT[FORECAST_PERIOD_MONTHLY],
+                                                     extendedDataRetentionHours=totalExtendedRetentionCount*HOURS_DICT[FORECAST_PERIOD_MONTHLY],
+                                                     putPayloadUnits=totalPutPayloadUnits*calculate_forecast_factor())
+            stream_cost = kinesispricing.calculate(kinesispdim)
+            if 'pricingRecords' in stream_cost: pricing_records.extend(stream_cost['pricingRecords'])
+
+            kinesisCost = kinesisCost + stream_cost['totalCost']
+    except Exception as e:
+        traceback.print_exc()
+        log.error("Exception message:["+str(e)+"]")
+    return kinesisCost    
+
+def compute_dynamo_cost(resource_manager, tagkey, tagvalue, pricing_records):
+    ddbCost = 0
+    try:
+        #DynamoDB
+        totalRead = 0
+        totalWrite = 0
+        ddbtables = resource_manager.get_resources(SERVICE_DYNAMODB, RESOURCE_DDB_TABLE)
+        #Provisioned Capacity Units
+        for t in ddbtables:
+            read, write = get_ddb_capacity_units(t.id)
+            log.info("Dynamo DB Provisioned Capacity Units - Table:{} Read:{} Write:{}".format(t.id, read, write))
+            totalRead += read
+            totalWrite += write
+        #TODO: add support for storage
+        if totalRead and totalWrite:
+            ddbpdim = data.DynamoDBPriceDimension(region=region, readCapacityUnitHours=totalRead*HOURS_DICT[FORECAST_PERIOD_MONTHLY],
+                                                                 writeCapacityUnitHours=totalWrite*HOURS_DICT[FORECAST_PERIOD_MONTHLY])
+            ddbtable_cost = ddbpricing.calculate(ddbpdim)
+            if 'pricingRecords' in ddbtable_cost: pricing_records.extend(ddbtable_cost['pricingRecords'])
+            ddbCost = ddbCost + ddbtable_cost['totalCost']
+    except Exception as e:
+        traceback.print_exc()
+        log.error("Exception message:["+str(e)+"]")
+    return ddbCost    
+
+def compute_lambda_cost(resource_manager, tagkey, tagvalue, pricing_records):
+    lambdaCost = 0
+    try:
+        #Lambda functions
+        #TODO: add support for lambda function qualifiers
+        #TODO: calculate data ingested into CloudWatch Logs
+        lambdafunctions = resource_manager.get_resources(SERVICE_LAMBDA, RESOURCE_LAMBDA_FUNCTION)
+        for func in lambdafunctions:
+          executions = calculate_lambda_executions(start, end, func)
+          avgduration = calculate_lambda_duration(start, end, func)
+          funcname = ''
+          qualifier = ''
+          fullname = ''
+          funcname = func.id
+          fullname = funcname
+          #if 'qualifier' in func:
+          #    qualifier = func['qualifier']
+          #    fullname += ":"+qualifier
+          memory = get_lambda_memory(funcname,qualifier)
+          log.info("Executions for Lambda function [{}]: [{}] - Memory:[{}] - Avg Duration:[{}]".format(funcname,executions,memory, avgduration))
+          if executions and avgduration:
+              try:
+                  #Note we're setting data transfer = 0, since we don't have a way to calculate it based on CW metrics alone
+                  #TODO:call a single time and include a GB-s price dimension to the Lambda calculator
+                  lambdapdim = data.LambdaPriceDimension(region=region, requestCount=executions*calculate_forecast_factor(),
+                                                    avgDurationMs=avgduration, memoryMb=memory, dataTranferOutInternetGb=0,
+                                                    dataTranferOutIntraRegionGb=0, dataTranferOutInterRegionGb=0, toRegion='')
+                  lambda_func_cost = lambdapricing.calculate(lambdapdim)
+                  if 'pricingRecords' in lambda_func_cost: pricing_records.extend(lambda_func_cost['pricingRecords'])
+                  lambdaCost = lambdaCost + lambda_func_cost['totalCost']
+
+              except Exception as failure:
+                  log.error('Error processing Lambda costs: %s', failure)
+          else:
+              log.info("Skipping pricing calculation for function [{}] - qualifier [{}] due to lack of executions in [{}-minute] time window".format(fullname, qualifier, METRIC_WINDOW))
+
+    except Exception as e:
+        traceback.print_exc()
+        log.error("Exception message:["+str(e)+"]")
+    return lambdaCost
+
+def compute_ec2_cost(resource_manager, tagkey, tagvalue, pricing_records, start, end):
+    ec2Cost = 0
+    elb_hours = 0
+    alb_hours = 0
+    elb_instances = {}
+
+    elb_hours = 0
+    elb_data_processed_gb = 0
+    elb_instances = {}
+    alb_hours = 0
+    alb_lcus = 0
+
+    try:
         #Get tagged ELB(s) and their registered instances
         #taggedelbs = find_elbs(tagkey, tagvalue)
         taggedelbs = resource_manager.get_resource_ids(SERVICE_ELB, RESOURCE_ELB)
@@ -146,7 +285,8 @@ def handler(event, context):
         taggednlbs = resource_manager.get_resource_ids(SERVICE_ELB, RESOURCE_NLB)
         if taggedelbs:
             log.info("Found tagged Classic ELBs:{}".format(taggedelbs))
-            elb_instances = get_elb_instances(taggedelbs)#TODO:add support to find registered instances for ALB and NLB
+            elb_instances = get_elb_instances(taggedelbs)
+            #TODO:add support to find registered instances for ALB and NLB
             #Get all EC2 instances registered with each tagged ELB, so we can calculate ELB data processed
             #Registered instances will be used for data processed calculation, and not for instance hours, unless they're tagged.
         if taggedalbs:
@@ -157,7 +297,6 @@ def handler(event, context):
         #TODO: once pricing for ALB and NLB is added to awspricecalculator, separate hours by ELB type
         elb_hours += (len(taggedelbs)+len(taggednlbs))*HOURS_DICT[DEFAULT_FORECAST_PERIOD]
         alb_hours += len(taggedalbs)*HOURS_DICT[DEFAULT_FORECAST_PERIOD]
-
 
         if elb_instances:
             try:
@@ -192,8 +331,6 @@ def handler(event, context):
                 pricing_records.extend(alb_cost['pricingRecords'])
                 ec2Cost = ec2Cost + alb_cost['totalCost']
 
-
-
         #Calculate EC2 compute time for ALL instance types found (subscribed to ELB or not) - group by instance types
         all_instance_dict = {}
         all_instance_dict.update(ec2_instances)
@@ -223,8 +360,14 @@ def handler(event, context):
                 ec2Cost = ec2Cost + ebs_storage_cost['totalCost']
             except Exception as failure:
                 log.error('Error processing ebs storage costs: %s', failure)
+    except Exception as e:
+        traceback.print_exc()
+        log.error("Exception message:["+str(e)+"]")
+    return ec2Cost
 
-
+def compute_rds_cost(resource_manager, tagkey, tagvalue, pricing_records):
+    rdsCost = 0
+    try:
         #Get tagged RDS DB instances
         #db_instances = get_db_instances_by_tag(tagkey, tagvalue)
         db_instances = get_db_instances_by_tag(resource_manager.get_resource_ids(SERVICE_RDS, RESOURCE_RDS_DB_INSTANCE))
@@ -275,131 +418,11 @@ def handler(event, context):
                 if 'pricingRecords' in rds_storage_cost: pricing_records.extend(rds_storage_cost['pricingRecords'])
                 rdsCost = rdsCost + rds_storage_cost['totalCost']
             except Exception as failure:
-                log.error('Error processing RDS storage costs: %s', failure)
-
-        #RDS Data Transfer - the Lambda function will assume all data transfer happens between RDS and EC2 instances
-
-        #Lambda functions
-        #TODO: add support for lambda function qualifiers
-        #TODO: calculate data ingested into CloudWatch Logs
-        lambdafunctions = resource_manager.get_resources(SERVICE_LAMBDA, RESOURCE_LAMBDA_FUNCTION)
-        for func in lambdafunctions:
-          executions = calculate_lambda_executions(start, end, func)
-          avgduration = calculate_lambda_duration(start, end, func)
-          funcname = ''
-          qualifier = ''
-          fullname = ''
-          funcname = func.id
-          fullname = funcname
-          #if 'qualifier' in func:
-          #    qualifier = func['qualifier']
-          #    fullname += ":"+qualifier
-          memory = get_lambda_memory(funcname,qualifier)
-          log.info("Executions for Lambda function [{}]: [{}] - Memory:[{}] - Avg Duration:[{}]".format(funcname,executions,memory, avgduration))
-          if executions and avgduration:
-              try:
-                  #Note we're setting data transfer = 0, since we don't have a way to calculate it based on CW metrics alone
-                  #TODO:call a single time and include a GB-s price dimension to the Lambda calculator
-                  lambdapdim = data.LambdaPriceDimension(region=region, requestCount=executions*calculate_forecast_factor(),
-                                                    avgDurationMs=avgduration, memoryMb=memory, dataTranferOutInternetGb=0,
-                                                    dataTranferOutIntraRegionGb=0, dataTranferOutInterRegionGb=0, toRegion='')
-                  lambda_func_cost = lambdapricing.calculate(lambdapdim)
-                  if 'pricingRecords' in lambda_func_cost: pricing_records.extend(lambda_func_cost['pricingRecords'])
-                  lambdaCost = lambdaCost + lambda_func_cost['totalCost']
-
-              except Exception as failure:
-                  log.error('Error processing Lambda costs: %s', failure)
-          else:
-              log.info("Skipping pricing calculation for function [{}] - qualifier [{}] due to lack of executions in [{}-minute] time window".format(fullname, qualifier, METRIC_WINDOW))
-
-
-        #DynamoDB
-        totalRead = 0
-        totalWrite = 0
-        ddbtables = resource_manager.get_resources(SERVICE_DYNAMODB, RESOURCE_DDB_TABLE)
-        #Provisioned Capacity Units
-        for t in ddbtables:
-            read, write = get_ddb_capacity_units(t.id)
-            log.info("Dynamo DB Provisioned Capacity Units - Table:{} Read:{} Write:{}".format(t.id, read, write))
-            totalRead += read
-            totalWrite += write
-        #TODO: add support for storage
-        if totalRead and totalWrite:
-            ddbpdim = data.DynamoDBPriceDimension(region=region, readCapacityUnitHours=totalRead*HOURS_DICT[FORECAST_PERIOD_MONTHLY],
-                                                                 writeCapacityUnitHours=totalWrite*HOURS_DICT[FORECAST_PERIOD_MONTHLY])
-            ddbtable_cost = ddbpricing.calculate(ddbpdim)
-            if 'pricingRecords' in ddbtable_cost: pricing_records.extend(ddbtable_cost['pricingRecords'])
-            ddbCost = ddbCost + ddbtable_cost['totalCost']
-
-
-        #Kinesis Streams
-        streams = resource_manager.get_resources(SERVICE_KINESIS, RESOURCE_STREAM)
-        totalShards = 0
-        totalExtendedRetentionCount = 0
-        totalPutPayloadUnits = 0
-        for s in streams:
-            log.info("Stream:[{}]".format(s.id))
-            tmpShardCount, tmpExtendedRetentionCount = get_kinesis_stream_shards(s.id)
-            totalShards += tmpShardCount
-            totalExtendedRetentionCount += tmpExtendedRetentionCount
-
-            totalPutPayloadUnits += calculate_kinesis_put_payload_units(start, end, s.id)
-
-        if totalShards:
-            kinesispdim = data.KinesisPriceDimension(region=region,
-                                                     shardHours=totalShards*HOURS_DICT[FORECAST_PERIOD_MONTHLY],
-                                                     extendedDataRetentionHours=totalExtendedRetentionCount*HOURS_DICT[FORECAST_PERIOD_MONTHLY],
-                                                     putPayloadUnits=totalPutPayloadUnits*calculate_forecast_factor())
-            stream_cost = kinesispricing.calculate(kinesispdim)
-            if 'pricingRecords' in stream_cost: pricing_records.extend(stream_cost['pricingRecords'])
-
-            kinesisCost = kinesisCost + stream_cost['totalCost']
-
-
-
-
-        #Do this after all calculations for all supported services have concluded
-        totalCost = ec2Cost + rdsCost + lambdaCost + ddbCost + kinesisCost
-        result['pricingRecords'] = pricing_records
-        result['totalCost'] = round(totalCost,2)
-        result['forecastPeriod']=DEFAULT_FORECAST_PERIOD
-        result['currency'] = CW_METRIC_DIMENSION_CURRENCY_USD
-
-        #Publish metrics to CloudWatch using the default namespace
-
-        if tagkey:
-          put_cw_metric_data(end, ec2Cost, CW_METRIC_DIMENSION_SERVICE_NAME_EC2, tagkey, tagvalue)
-          put_cw_metric_data(end, rdsCost, CW_METRIC_DIMENSION_SERVICE_NAME_RDS, tagkey, tagvalue)
-          put_cw_metric_data(end, lambdaCost, CW_METRIC_DIMENSION_SERVICE_NAME_LAMBDA, tagkey, tagvalue)
-          put_cw_metric_data(end, ddbCost, CW_METRIC_DIMENSION_SERVICE_NAME_DYNAMODB, tagkey, tagvalue)
-          put_cw_metric_data(end, kinesisCost, CW_METRIC_DIMENSION_SERVICE_NAME_KINESIS, tagkey, tagvalue)
-          put_cw_metric_data(end, totalCost, CW_METRIC_DIMENSION_SERVICE_NAME_TOTAL, tagkey, tagvalue)
-
-
-
-        log.info("Estimated monthly cost for resources tagged with key={},value={} : [{}]".format(tagkey, tagvalue, json.dumps(result,sort_keys=False,indent=4)))
-
-    except NoDataFoundError as ndf:
-        log.error ("NoDataFoundError [{}]".format(ndf))
-
+                log.error('Error processing RDS storage costs: %s', failure) 
     except Exception as e:
         traceback.print_exc()
         log.error("Exception message:["+str(e)+"]")
-
-
-    return result
-
-#TODO: calculate data transfer for instances that are not registered with the ELB
-#TODO: Support different OS for EC2 instances (see how engine and license combinations are calculated for RDS)
-#TODO: log the actual AWS resources that are found for the price calculation
-#TODO: add support for detailed metrics fee
-#TODO: add support for EBS optimized
-#TODO: add support for EIP
-#TODO: add support for EC2 operating systems other than Linux
-#TODO: calculate monthly hours based on the current month, instead of assuming 720
-#TODO: add support for different forecast periods (1 hour, 1 day, 1 month, etc.)
-#TODO: add support for Spot and Reserved. Function only supports On-demand instances at the time
-
+    return rdsCost
 
 def put_cw_metric_data(timestamp, cost, service, tagkey, tagvalue):
 
@@ -419,7 +442,6 @@ def put_cw_metric_data(timestamp, cost, service, tagkey, tagvalue):
             }
         ]
     )
-
 
 def get_elb_instances(elbnames):
     result = {}
@@ -442,7 +464,6 @@ def get_elb_instances(elbnames):
 
     return result
 
-
 def get_ec2_instances_by_tag(tagkey, tagvalue):
     result = {}
     response = ec2client.describe_instances(Filters=[{'Name': 'tag:'+tagkey, 'Values':[tagvalue]},
@@ -456,8 +477,6 @@ def get_ec2_instances_by_tag(tagkey, tagvalue):
 
     return result
 
-
-
 def get_db_instances_by_tag(dbIds):
     result = {}
     #TODO: paginate
@@ -468,8 +487,6 @@ def get_db_instances_by_tag(dbIds):
             for d in dbInstances:
                 result[d['DbiResourceId']]=d
     return result
-
-
 
 def get_non_elb_instances_by_tag(tagkey, tagvalue, elb_instances):
     result = {}
@@ -493,7 +510,6 @@ def get_instance_type_count(instance_dict):
             result[instance_type] = 1
     return result
 
-
 def get_db_instance_type_count(db_instance_dict):
     result = {}
     for key in db_instance_dict:
@@ -509,7 +525,6 @@ def get_db_instance_type_count(db_instance_dict):
         else:
             result[db_instance_key] = 1
     return result
-
 
 def get_db_storage_type_count(db_instance_dict):
     result = {}
@@ -536,9 +551,6 @@ def get_db_storage_type_count(db_instance_dict):
 
     return result
 
-
-
-
 def get_storage_by_ebs_type(instance_dict):
     result = {}
     iops = 0
@@ -563,7 +575,6 @@ def get_storage_by_ebs_type(instance_dict):
 
     return result, iops
 
-
 def get_total_snapshot_storage(tagkey, tagvalue):
     result = 0
     snapshots = ec2client.describe_snapshots(Filters=[{'Name': 'tag:'+tagkey,'Values': [tagvalue]}])
@@ -573,8 +584,6 @@ def get_total_snapshot_storage(tagkey, tagvalue):
 
     #log.info("total snapshot size:["+str(result)+"]")
     return result
-
-
 
 
 """
@@ -615,8 +624,6 @@ def calculate_elb_data_processed(start, end, elb_instances):
 """
 For each ALB, get the value for the ConsumedLCUs metric
 """
-
-
 def calculate_alb_lcus(start, end, albs):
     result = 0
 
@@ -637,9 +644,6 @@ def calculate_alb_lcus(start, end, albs):
     log.info ("Total ConsumedLCUs consumed by ALBs in time window of ["+str(METRIC_WINDOW)+"] minutes :["+str(result)+"]")
 
     return result
-
-
-
 
 
 def calculate_lambda_executions(start, end, func):
@@ -687,7 +691,6 @@ def calculate_lambda_duration(start, end, func):
     log.debug("calculate_lambda_duration: [{}]".format(result))
 
     return result
-
 
 def get_lambda_memory(functionname, qualifier):
     result = 0
@@ -797,13 +800,10 @@ def calculate_time_range():
     log.info("start:["+str(start)+"] - end:["+str(end)+"]")
     return start, end
 
-
-
 def calculate_forecast_factor():
     result = (60 / METRIC_WINDOW ) * HOURS_DICT[DEFAULT_FORECAST_PERIOD]
     log.debug("Forecast factor:["+str(result)+"]")
     return result
-
 
 def get_ec2_instances(registered, all):
     result = []
@@ -823,11 +823,13 @@ def init_clients(context):
     global tagsclient
     global region
     global awsaccount
+    global default_sts
 
 
     arn = context.invoked_function_arn
     region = arn.split(":")[3] #ARN format is arn:aws:lambda:us-east-1:xxx:xxxx
-    awsaccount = arn.split(":")[4]
+    awsaccount = arn.split(":")[4]    
+
     ec2client = boto3.client('ec2',region)
     rdsclient = boto3.client('rds',region)
     elbclient = boto3.client('elb',region) #classic load balancers
@@ -837,28 +839,46 @@ def init_clients(context):
     kinesisclient = boto3.client('kinesis',region)
     cwclient = boto3.client('cloudwatch', region)
     tagsclient = boto3.client('resourcegroupstaggingapi', region)
+    default_sts = boto3.client('sts')
 
 
 class ResourceManager():
     def __init__(self, tagkey, tagvalue):
         self.resources = []
-        self.init_resources(tagkey, tagvalue)
+        self.init_resources_all_region(tagkey, tagvalue)
+        # self.init_resources(tagkey, tagvalue)  
+
+    def init_resources_all_region(self, tagkey, tagvalue):
+        # TODO move the config to lambda to get better performance
+        config_regions = ('ap-southeast-1', 'us-east-1')
+        for r in config_regions:
+            if (self.region_is_available(r)):
+                self.init_resources(r, tagkey, tagvalue)
+            else:
+                log.info('the region %s is not avaiable', r)
+
+        self.print_all_resources()
+
+    def print_all_resources(self):
+        for res in self.resources:
+            log.info("Tagged resource:{}".format(res.__dict__))
 
 
-    def init_resources(self, tagkey, tagvalue):
+    def init_resources(self, region, tagkey, tagvalue):
+        log.info('looking resource in region %s', region)
         #TODO: Implement pagination
-        response = tagsclient.get_resources(
+        clientByRegion = boto3.client('resourcegroupstaggingapi', region)
+        response = clientByRegion.get_resources(
                             TagsPerPage = 500,
                             TagFilters=[{'Key': tagkey,'Values': [tagvalue]}],
                             ResourceTypeFilters=self.get_resource_type_filters(SERVICE_RESOURCE_MAP)
                     )
-
         if 'ResourceTagMappingList' in response:
             for r in response['ResourceTagMappingList']:
                 res = self.extract_resource(r['ResourceARN'])
                 if res:
                     self.resources.append(res)
-                    #log.info("Tagged resource:{}".format(res.__dict__))
+                    # log.info("Tagged resource:{}".format(res.__dict__))
 
     #Return a service:resource list in the format the ResourceGroupTagging API expects it
     def get_resource_type_filters(self, service_resource_map):
@@ -907,7 +927,14 @@ class ResourceManager():
                     result.append(r.id)
         return result
 
-
+    def region_is_available(self, region):
+        regional_sts = boto3.client('sts', region_name=region)
+        try:
+            regional_sts.get_caller_identity()
+            return True
+        except ClientError as e:
+            default_sts.get_caller_identity()
+            return False      
 
 
     class Resource():
