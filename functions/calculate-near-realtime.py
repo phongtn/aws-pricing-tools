@@ -128,7 +128,7 @@ def handler(event, context):
 
         ec2Cost = compute_ec2_cost(resource_manager, tagkey, tagvalue, pricing_records, start, end)
         rdsCost = compute_rds_cost(resource_manager, tagkey, tagvalue, pricing_records)
-        lambdaCost = compute_lambda_cost(resource_manager, tagkey, tagvalue, pricing_records)
+        lambdaCost = compute_lambda_cost(resource_manager, tagkey, tagvalue, pricing_records, start, end)
         ddbCost = compute_dynamo_cost(resource_manager, tagkey, tagvalue, pricing_records)
         kinesisCost  = compute_kinesis_cost(resource_manager, tagkey, tagvalue, pricing_records)
 
@@ -224,7 +224,7 @@ def compute_dynamo_cost(resource_manager, tagkey, tagvalue, pricing_records):
         log.error("Exception message:["+str(e)+"]")
     return ddbCost    
 
-def compute_lambda_cost(resource_manager, tagkey, tagvalue, pricing_records):
+def compute_lambda_cost(resource_manager, tagkey, tagvalue, pricing_records, start, end):
     lambdaCost = 0
     try:
         #Lambda functions

@@ -1,7 +1,7 @@
 {
   "tag": { 
-    "key": "<tag key>",
-    "value": "<tag value>"
+    "key": "monitor",
+    "value": "cost"
     }
 }
 
