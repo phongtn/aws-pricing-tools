@@ -30,3 +30,6 @@ scripts/kinesis-pricing.py
 scripts/context.py
 scripts/propagate-lambda-code.py
 
+# remove config file
+test/events/constant-tag.json
+
