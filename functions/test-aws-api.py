@@ -1,15 +1,11 @@
 from __future__ import print_function
-import datetime
-import json
-import logging,traceback
-import math
+
+import logging
 import os
 import sys
 
-
 import boto3
 from botocore.exceptions import ClientError
-
 
 __location__ = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(__location__, "../"))
@@ -17,13 +13,7 @@ sys.path.append(os.path.join(__location__, "../vendored"))
 
 
 import awspricecalculator.ec2.pricing as ec2pricing
-import awspricecalculator.rds.pricing as rdspricing
-import awspricecalculator.awslambda.pricing as lambdapricing
-import awspricecalculator.dynamodb.pricing as ddbpricing
-import awspricecalculator.kinesis.pricing as kinesispricing
 import awspricecalculator.common.models as data
-import awspricecalculator.common.consts as consts
-from awspricecalculator.common.errors import NoDataFoundError
 
 logging.basicConfig()
 log = logging.getLogger()
@@ -253,8 +243,8 @@ def get_instance_type_count(instance_dict):
 
 def main():
   init_clients()
-  tagkey = 'stack-name'
-  tagvalue = 'cost-monitor'
+  tagkey = 'monitor'
+  tagvalue = 'cost'
   ec2Cost = 0
   pricing_records = []
 
